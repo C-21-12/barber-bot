@@ -6,12 +6,12 @@ import os
 # --- ТОКЕН БОТА ---
 # Отримуєш у @BotFather після команди /newbot
 # Краще зберігати токен у змінній оточення BOT_TOKEN, а не прямо в коді.
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8488300154:AAEPW210HmOJVRv2EdtgD7eFGD_36hDPMjc")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
 # --- ID АДМІНА (БАРБЕРА) ---
 # Свій Telegram ID можна дізнатись у бота @userinfobot
 # Можна вказати декілька ID через кому, якщо адмінів більше одного
-ADMIN_IDS = [693154188]
+ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()] 
 
 # --- ФАЙЛ БАЗИ ДАНИХ ---
 DB_PATH = os.getenv("DB_PATH", "barber_bot.db")
