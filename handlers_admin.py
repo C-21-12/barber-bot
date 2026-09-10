@@ -10,7 +10,7 @@ from datetime import datetime
 import database as db
 import keyboards as kb
 from config import ADMIN_IDS
-from states import SetPrice, ManualBooking
+from states import SetPrice, ManualBooking, Broadcast
 
 router = Router()
 # Всі обробники в цьому файлі спрацьовують ТІЛЬКИ для адмінів
@@ -240,5 +240,120 @@ async def admin_manual_booking_phone(message: Message, state: FSMContext):
 
     await message.answer(
         f"✅ Записано: {name} на {kb.format_date_human(date_str)} о {time_str}.",
+        reply_markup=kb.admin_main_menu()
+    )
+
+
+# ---------- ЗАКРИТТЯ ОКРЕМОГО СЛОТУ ----------
+
+@router.message(F.text == "🔒 Закрити слот")
+async def admin_close_slot_start(message: Message):
+    dates = await db.get_all_dates_ahead()
+    # Показуємо тільки дати, де є хоча б один вільний слот
+    dates_with_free = []
+    for d in dates:
+        free = await db.get_free_slots_for_date(d)
+        if free:
+            dates_with_free.append(d)
+    if not dates_with_free:
+        await message.answer("Немає дат із вільними слотами для закриття.")
+        return
+    await message.answer(
+        "Обери дату, в якій хочеш закрити конкретний слот:",
+        reply_markup=kb.dates_keyboard(dates_with_free, prefix="admin_close_slot_date")
+    )
+
+
+@router.callback_query(F.data == "admin_close_slot_back")
+async def admin_close_slot_back(callback: CallbackQuery):
+    dates = await db.get_all_dates_ahead()
+    dates_with_free = []
+    for d in dates:
+        free = await db.get_free_slots_for_date(d)
+        if free:
+            dates_with_free.append(d)
+    if not dates_with_free:
+        await callback.message.edit_text("Немає дат із вільними слотами.")
+        await callback.answer()
+        return
+    await callback.message.edit_text(
+        "Обери дату, в якій хочеш закрити конкретний слот:",
+        reply_markup=kb.dates_keyboard(dates_with_free, prefix="admin_close_slot_date")
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_close_slot_date:"))
+async def admin_close_slot_choose_time(callback: CallbackQuery):
+    date_str = callback.data.split(":", 1)[1]
+    free_times = await db.get_free_slots_for_date(date_str)
+    if not free_times:
+        await callback.answer("На цю дату вже немає вільних слотів.", show_alert=True)
+        return
+    await callback.message.edit_text(
+        f"Вільні слоти на {kb.format_date_human(date_str)}.\n"
+        f"Обери час, який хочеш закрити:",
+        reply_markup=kb.admin_close_slot_times_keyboard(date_str, free_times)
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_close_slot:"))
+async def admin_close_slot_confirm(callback: CallbackQuery):
+    _, date_str, time_str = callback.data.split(":", 2)
+    success = await db.close_slot(date_str, time_str)
+    if not success:
+        await callback.answer(
+            "Цей слот вже зайнятий клієнтом — закрити не можна.", show_alert=True
+        )
+        return
+    await callback.message.edit_text(
+        f"🔒 Слот {kb.format_date_human(date_str)} о {time_str} закрито.\n"
+        f"Клієнти більше не бачать цей час для запису."
+    )
+    await callback.answer()
+
+
+# ---------- ДОВІЛЬНА РОЗСИЛКА ----------
+
+@router.message(F.text == "📢 Розсилка")
+async def admin_broadcast_start(message: Message, state: FSMContext):
+    await message.answer(
+        "Напиши текст повідомлення, яке хочеш надіслати всім клієнтам.\n"
+        "Щоб скасувати — напиши /cancel"
+    )
+    await state.set_state(Broadcast.waiting_for_message)
+
+
+@router.message(StateFilter(Broadcast.waiting_for_message), Command("cancel"))
+async def admin_broadcast_cancel(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Розсилку скасовано.", reply_markup=kb.admin_main_menu())
+
+
+@router.message(StateFilter(Broadcast.waiting_for_message))
+async def admin_broadcast_send(message: Message, state: FSMContext, bot: Bot):
+    if not message.text:
+        await message.answer("Розсилка підтримує лише текстові повідомлення. Напиши текст:")
+        return
+
+    text = message.text
+    await state.clear()
+
+    clients = await db.get_all_clients()
+    if not clients:
+        await message.answer("У базі поки немає жодного клієнта для розсилки.", reply_markup=kb.admin_main_menu())
+        return
+
+    sent, failed = 0, 0
+    for telegram_id, name in clients:
+        try:
+            await bot.send_message(telegram_id, text)
+            sent += 1
+        except Exception:
+            failed += 1
+
+    await message.answer(
+        f"Розсилку завершено: надіслано {sent}, не вдалось {failed}.",
         reply_markup=kb.admin_main_menu()
     )
