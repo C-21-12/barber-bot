@@ -254,6 +254,26 @@ async def close_day(date_str: str):
         await db.commit()
 
 
+async def close_slot(date_str: str, time_str: str) -> bool:
+    """Закриває один конкретний вільний слот. Повертає False, якщо слот вже зайнятий або закритий."""
+    # Перевіряємо, що слот справді вільний (не заброньований)
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT id FROM bookings WHERE date = ? AND time = ?", (date_str, time_str)
+        )
+        if await cursor.fetchone():
+            return False  # слот заброньований клієнтом — не можна закрити
+        try:
+            await db.execute(
+                "INSERT OR IGNORE INTO closed_slots (date, time) VALUES (?, ?)",
+                (date_str, time_str)
+            )
+            await db.commit()
+            return True
+        except Exception:
+            return False
+
+
 async def reopen_day(date_str: str):
     """Знову відкриває день (прибирає позначки 'закрито' для вже минулих закриттів)."""
     async with aiosqlite.connect(DB_PATH) as db:
