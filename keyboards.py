@@ -86,10 +86,26 @@ def admin_main_menu() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text="📋 Всі записи")],
             [KeyboardButton(text="➕ Записати клієнта"), KeyboardButton(text="🚫 Закрити день")],
-            [KeyboardButton(text="💰 Встановити ціну")],
+            [KeyboardButton(text="🔒 Закрити слот"), KeyboardButton(text="💰 Встановити ціну")],
+            [KeyboardButton(text="📢 Розсилка")],
         ],
         resize_keyboard=True
     )
+
+
+def admin_close_slot_times_keyboard(date_str: str, free_times: list[str]) -> InlineKeyboardMarkup:
+    """Клавіатура вільних слотів для закриття адміном."""
+    buttons = []
+    row = []
+    for i, t in enumerate(free_times, start=1):
+        row.append(InlineKeyboardButton(text=t, callback_data=f"admin_close_slot:{date_str}:{t}"))
+        if i % 4 == 0:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад до дат", callback_data="admin_close_slot_back")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def admin_day_bookings_keyboard(bookings: list) -> InlineKeyboardMarkup:
