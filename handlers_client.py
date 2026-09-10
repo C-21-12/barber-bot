@@ -86,7 +86,7 @@ async def client_show_times(callback: CallbackQuery):
         return
     await callback.message.edit_text(
         f"Вільні години на {kb.format_date_human(date_str)}:",
-        reply_markup=kb.times_keyboard(date_str, times, prefix="time")
+        reply_markup=kb.times_keyboard(date_str, times, prefix="date")
     )
     await callback.answer()
 
