@@ -126,6 +126,8 @@ def _generate_day_slots(date_obj: datetime) -> list[str]:
 
 async def get_free_slots_for_date(date_str: str) -> list[str]:
     """Вільні слоти для клієнтів на конкретну дату (виключає заброньовані та закриті)."""
+    # Обрізаємо до YYYY-MM-DD на випадок якщо прийшов рядок з часом
+    date_str = date_str[:10]
     date_obj = datetime.strptime(date_str, "%Y-%m-%d")
     all_slots = _generate_day_slots(date_obj)
     if not all_slots:
@@ -325,3 +327,4 @@ async def get_monthly_stats(year: int, month: int):
         """, (f"{prefix}%",))
         row = await cursor.fetchone()
         return row[0], row[1]
+                             
