@@ -10,6 +10,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import BotCommand, BotCommandScopeDefault
 
 from config import BOT_TOKEN, ADMIN_IDS, DB_PATH
 import database as db
@@ -17,7 +18,11 @@ import handlers_admin
 import handlers_client
 from scheduler import setup_scheduler
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 # Шлях, де база лежала ДО того, як з'явився DB_PATH (наприклад, до підключення Volume).
 # Якщо в новому місці (DB_PATH) бази ще немає, а стара база на цьому шляху існує —
@@ -35,19 +40,30 @@ def migrate_old_db_if_needed():
         if target_dir:
             os.makedirs(target_dir, exist_ok=True)
         shutil.copy2(OLD_DB_PATH, DB_PATH)
-        print(f"Стару базу даних перенесено: {OLD_DB_PATH} → {DB_PATH}")
+        logger.info("Стару базу даних перенесено: %s -> %s", OLD_DB_PATH, DB_PATH)
+
+
+async def set_commands(bot: Bot):
+    """Список команд у синьому меню Telegram."""
+    await bot.set_my_commands(
+        [
+            BotCommand(command="start", description="Головне меню"),
+            BotCommand(command="help", description="Як користуватись ботом"),
+        ],
+        scope=BotCommandScopeDefault(),
+    )
 
 
 async def main():
     if BOT_TOKEN == "ВСТАВ_СЮДИ_СВІЙ_ТОКЕН" or not BOT_TOKEN:
         raise RuntimeError(
-            "Не вказано BOT_TOKEN! Відкрий config.py (або встанови змінну оточення BOT_TOKEN) "
-            "і встав токен, отриманий від @BotFather."
+            "Не вказано BOT_TOKEN! Встанови змінну оточення BOT_TOKEN "
+            "(токен, отриманий від @BotFather)."
         )
     if not ADMIN_IDS:
         raise RuntimeError(
-            "Не вказано ADMIN_IDS! Відкрий config.py (або встанови змінну оточення ADMIN_IDS) "
-            "і встав свій Telegram ID (можна дізнатись у @userinfobot)."
+            "Не вказано ADMIN_IDS! Встанови змінну оточення ADMIN_IDS "
+            "(свій Telegram ID, можна дізнатись у @userinfobot)."
         )
 
     migrate_old_db_if_needed()
@@ -61,14 +77,25 @@ async def main():
     dp.include_router(handlers_client.router)
 
     scheduler = setup_scheduler(bot)
-    scheduler.start()
 
-    print("Бот запущено. Натисни Ctrl+C, щоб зупинити.")
+    # Все мережеві виклики — всередині try, щоб навіть при помилці на старті
+    # (наприклад, неправильний токен) коректно закрити сесію і планувальник.
     try:
-        await dp.start_polling(bot)
+        me = await bot.get_me()
+        await set_commands(bot)
+        scheduler.start()
+        logger.info("Бот @%s запущено. Натисни Ctrl+C, щоб зупинити.", me.username)
+        # drop_pending_updates: після простою бот не відпрацьовує чергу старих натискань
+        await dp.start_polling(bot, drop_pending_updates=True)
     finally:
+        if scheduler.running:
+            scheduler.shutdown(wait=False)
         await bot.session.close()
+        logger.info("Бот зупинено.")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        pass

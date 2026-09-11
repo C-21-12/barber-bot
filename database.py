@@ -2,14 +2,32 @@
 # Весь код роботи з базою даних SQLite зібраний тут.
 # Використовуємо aiosqlite, щоб не блокувати бота під час запитів до БД.
 
-import aiosqlite
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
-from config import DB_PATH, WORK_SCHEDULE, SLOT_MINUTES, DAYS_AHEAD
+
+import aiosqlite
+
+from config import DB_PATH, WORK_SCHEDULE, SLOT_MINUTES, DAYS_AHEAD, MAX_ACTIVE_BOOKINGS
+from utils import now, today_str, TZ
+
+
+@asynccontextmanager
+async def _connect():
+    """Одна точка підключення до БД.
+    busy_timeout потрібен, бо підключення створюється на кожен запит: без нього
+    паралельні клієнти ловлять помилку 'database is locked'."""
+    # isolation_level=None — вимикаємо неявні транзакції sqlite3,
+    # щоб BEGIN IMMEDIATE / COMMIT у create_booking керувались явно.
+    async with aiosqlite.connect(DB_PATH, timeout=15, isolation_level=None) as db:
+        await db.execute("PRAGMA busy_timeout = 15000")
+        yield db
 
 
 async def init_db():
     """Створює таблиці, якщо їх ще немає. Викликається один раз при старті бота."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with _connect() as db:
+        # WAL вмикається один раз і зберігається у файлі БД — читання не блокує запис.
+        await db.execute("PRAGMA journal_mode = WAL")
         await db.execute("""
             CREATE TABLE IF NOT EXISTS clients (
                 telegram_id INTEGER PRIMARY KEY,
@@ -57,36 +75,40 @@ async def init_db():
                 value TEXT
             )
         """)
+        # Індекси під найчастіші вибірки (записи за датою, записи клієнта)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_bookings_date ON bookings(date)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_bookings_client ON bookings(telegram_id, date)")
         # Ціна за замовчуванням, якщо ще не встановлена
-        await db.execute("""
-            INSERT OR IGNORE INTO settings (key, value) VALUES ('price', '0')
-        """)
-        await db.commit()
+        await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('price', '0')")
 
 
 # ---------- НАЛАШТУВАННЯ (ЦІНА) ----------
 
 async def get_price() -> float:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with _connect() as db:
         cursor = await db.execute("SELECT value FROM settings WHERE key = 'price'")
         row = await cursor.fetchone()
-        return float(row[0]) if row else 0.0
+        if not row:
+            return 0.0
+        try:
+            return float(row[0])
+        except (TypeError, ValueError):
+            return 0.0
 
 
 async def set_price(new_price: float):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with _connect() as db:
         await db.execute(
             "INSERT INTO settings (key, value) VALUES ('price', ?) "
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (str(new_price),)
         )
-        await db.commit()
 
 
 # ---------- КЛІЄНТИ ----------
 
 async def add_or_update_client(telegram_id: int, name: str, username: str = None, phone: str = None):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with _connect() as db:
         await db.execute("""
             INSERT INTO clients (telegram_id, name, username, phone, created_at)
             VALUES (?, ?, ?, ?, ?)
@@ -94,14 +116,19 @@ async def add_or_update_client(telegram_id: int, name: str, username: str = None
                 name = excluded.name,
                 username = excluded.username,
                 phone = COALESCE(excluded.phone, clients.phone)
-        """, (telegram_id, name, username, phone, datetime.now().isoformat()))
-        await db.commit()
+        """, (telegram_id, name, username, phone, now().isoformat()))
 
 
 async def get_all_clients():
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with _connect() as db:
         cursor = await db.execute("SELECT telegram_id, name FROM clients")
         return await cursor.fetchall()
+
+
+async def count_clients() -> int:
+    async with _connect() as db:
+        cursor = await db.execute("SELECT COUNT(*) FROM clients")
+        return (await cursor.fetchone())[0]
 
 
 # ---------- ГЕНЕРАЦІЯ СЛОТІВ ----------
@@ -124,73 +151,171 @@ def _generate_day_slots(date_obj: datetime) -> list[str]:
     return slots
 
 
+def _parse_date(date_str: str) -> datetime | None:
+    try:
+        return datetime.strptime(date_str[:10], "%Y-%m-%d")
+    except (ValueError, TypeError):
+        return None
+
+
+def is_in_past(date_str: str, time_str: str) -> bool:
+    """Чи слот уже минув (у робочому часовому поясі)."""
+    try:
+        slot = datetime.strptime(f"{date_str[:10]} {time_str}", "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
+    except (ValueError, TypeError):
+        return True
+    return slot <= now()
+
+
+def slot_exists_in_schedule(date_str: str, time_str: str) -> bool:
+    """Чи такий час взагалі існує в графіку роботи на цю дату."""
+    date_obj = _parse_date(date_str)
+    if not date_obj:
+        return False
+    return time_str in _generate_day_slots(date_obj)
+
+
 async def get_free_slots_for_date(date_str: str) -> list[str]:
-    # fix: strip time component
-    """Вільні слоти для клієнтів на конкретну дату (виключає заброньовані та закриті)."""
+    """Вільні слоти для клієнтів на конкретну дату.
+    Виключає заброньовані, закриті адміном і ті, що вже минули."""
     # Обрізаємо до YYYY-MM-DD на випадок якщо прийшов рядок з часом
     date_str = date_str[:10]
-    date_obj = datetime.strptime(date_str, "%Y-%m-%d")
+    date_obj = _parse_date(date_str)
+    if not date_obj:
+        return []
     all_slots = _generate_day_slots(date_obj)
     if not all_slots:
         return []
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with _connect() as db:
         cursor = await db.execute("SELECT time FROM bookings WHERE date = ?", (date_str,))
         booked = {row[0] for row in await cursor.fetchall()}
 
         cursor = await db.execute("SELECT time FROM closed_slots WHERE date = ?", (date_str,))
         closed = {row[0] for row in await cursor.fetchall()}
 
-    return [t for t in all_slots if t not in booked and t not in closed]
+    return [
+        t for t in all_slots
+        if t not in booked and t not in closed and not is_in_past(date_str, t)
+    ]
 
 
 async def get_all_dates_ahead() -> list[str]:
     """Список усіх дат (наступні DAYS_AHEAD днів), незалежно від наявності вільних слотів.
     Потрібно адміну, наприклад, щоб закрити день."""
-    today = datetime.now()
+    today = now()
     return [(today + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(DAYS_AHEAD)]
 
 
 async def get_available_dates() -> list[str]:
-    """Список дат (наступні DAYS_AHEAD днів), на які є хоча б один вільний слот."""
+    """Список дат (наступні DAYS_AHEAD днів), на які є хоча б один вільний слот.
+    Одне підключення на всі дні — раніше було 2 запити на кожен з 14 днів,
+    тобто 28 запитів на одне натискання кнопки."""
+    dates = await get_all_dates_ahead()
+    if not dates:
+        return []
+
+    placeholders = ",".join("?" * len(dates))
+    async with _connect() as db:
+        cursor = await db.execute(
+            f"SELECT date, time FROM bookings WHERE date IN ({placeholders})", dates
+        )
+        booked = {(r[0], r[1]) for r in await cursor.fetchall()}
+        cursor = await db.execute(
+            f"SELECT date, time FROM closed_slots WHERE date IN ({placeholders})", dates
+        )
+        closed = {(r[0], r[1]) for r in await cursor.fetchall()}
+
     result = []
-    today = datetime.now()
-    for i in range(DAYS_AHEAD):
-        d = today + timedelta(days=i)
-        date_str = d.strftime("%Y-%m-%d")
-        free = await get_free_slots_for_date(date_str)
-        if free:
+    for date_str in dates:
+        date_obj = _parse_date(date_str)
+        for t in _generate_day_slots(date_obj):
+            if (date_str, t) in booked or (date_str, t) in closed:
+                continue
+            if is_in_past(date_str, t):
+                continue
             result.append(date_str)
+            break
     return result
 
 
 # ---------- БРОНЮВАННЯ ----------
 
+async def count_active_bookings(telegram_id: int) -> int:
+    """Скільки майбутніх записів уже має клієнт."""
+    async with _connect() as db:
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM bookings WHERE telegram_id = ? AND date >= ?",
+            (telegram_id, today_str())
+        )
+        return (await cursor.fetchone())[0]
+
+
 async def create_booking(date: str, time: str, telegram_id: int = None,
-                          client_name: str = "", username: str = None, phone: str = None) -> bool:
-    """Створює запис. Повертає False, якщо слот вже зайнятий."""
+                         client_name: str = "", username: str = None, phone: str = None,
+                         enforce_rules: bool = True) -> tuple[bool, str]:
+    """Створює запис і повертає (успіх, причина_відмови).
+
+    enforce_rules=True — звичайне клієнтське бронювання: перевіряємо графік,
+    минулий час, закриті слоти й ліміт записів на клієнта. Перевірка живе саме
+    тут, а не в хендлері, бо кнопки в старих повідомленнях лишаються
+    натискабельними скільки завгодно довго — клієнт може натиснути їх і через
+    тиждень, коли слот уже закритий або минув.
+
+    enforce_rules=False — ручний запис адміном: барбер свідомо може записати
+    когось поза графіком.
+    """
+    date = date[:10]
     price = await get_price()
-    try:
-        async with aiosqlite.connect(DB_PATH) as db:
+
+    if enforce_rules:
+        if not slot_exists_in_schedule(date, time):
+            return False, "not_in_schedule"
+        if is_in_past(date, time):
+            return False, "past"
+
+    async with _connect() as db:
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            if enforce_rules:
+                cursor = await db.execute(
+                    "SELECT 1 FROM closed_slots WHERE date = ? AND time = ?", (date, time)
+                )
+                if await cursor.fetchone():
+                    await db.execute("ROLLBACK")
+                    return False, "closed"
+
+                if telegram_id is not None and MAX_ACTIVE_BOOKINGS > 0:
+                    cursor = await db.execute(
+                        "SELECT COUNT(*) FROM bookings WHERE telegram_id = ? AND date >= ?",
+                        (telegram_id, today_str())
+                    )
+                    if (await cursor.fetchone())[0] >= MAX_ACTIVE_BOOKINGS:
+                        await db.execute("ROLLBACK")
+                        return False, "limit"
+
             await db.execute("""
                 INSERT INTO bookings (date, time, telegram_id, client_name, username, phone, price, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (date, time, telegram_id, client_name, username, phone, price, datetime.now().isoformat()))
-            await db.commit()
-        return True
-    except aiosqlite.IntegrityError:
-        return False
+            """, (date, time, telegram_id, client_name, username, phone, price, now().isoformat()))
+            await db.execute("COMMIT")
+            return True, "ok"
+        except aiosqlite.IntegrityError:
+            await db.execute("ROLLBACK")
+            return False, "taken"
+        except Exception:
+            await db.execute("ROLLBACK")
+            raise
 
 
 async def cancel_booking(booking_id: int) -> bool:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with _connect() as db:
         cursor = await db.execute("DELETE FROM bookings WHERE id = ?", (booking_id,))
-        await db.commit()
         return cursor.rowcount > 0
 
 
 async def get_booking_by_id(booking_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with _connect() as db:
         cursor = await db.execute(
             "SELECT id, date, time, telegram_id, client_name, phone, price, username FROM bookings WHERE id = ?",
             (booking_id,)
@@ -200,94 +325,107 @@ async def get_booking_by_id(booking_id: int):
 
 async def get_client_bookings(telegram_id: int):
     """Майбутні записи конкретного клієнта."""
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with _connect() as db:
         cursor = await db.execute("""
             SELECT id, date, time FROM bookings
             WHERE telegram_id = ? AND date >= ?
             ORDER BY date, time
-        """, (telegram_id, today_str))
+        """, (telegram_id, today_str()))
         return await cursor.fetchall()
 
 
 async def get_all_upcoming_bookings():
     """Всі майбутні записи — для перегляду адміном."""
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with _connect() as db:
         cursor = await db.execute("""
-            SELECT id, date, time, client_name, phone, telegram_id FROM bookings
+            SELECT id, date, time, client_name, phone, telegram_id, username FROM bookings
             WHERE date >= ?
             ORDER BY date, time
-        """, (today_str,))
+        """, (today_str(),))
         return await cursor.fetchall()
 
 
 async def get_dates_with_bookings() -> list[str]:
     """Дати (від сьогодні), на які є хоча б один активний запис."""
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with _connect() as db:
         cursor = await db.execute("""
             SELECT DISTINCT date FROM bookings WHERE date >= ? ORDER BY date
-        """, (today_str,))
+        """, (today_str(),))
         return [row[0] for row in await cursor.fetchall()]
 
 
 async def get_bookings_for_date(date_str: str):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with _connect() as db:
         cursor = await db.execute("""
             SELECT id, time, client_name, phone, telegram_id, username FROM bookings
             WHERE date = ? ORDER BY time
-        """, (date_str,))
+        """, (date_str[:10],))
         return await cursor.fetchall()
 
 
-# ---------- ЗАКРИТТЯ ДНЯ ----------
+# ---------- ЗАКРИТТЯ / ВІДКРИТТЯ ДНЯ ----------
 
-async def close_day(date_str: str):
-    """Закриває всі ВІЛЬНІ слоти на день (заброньовані записи не чіпає)."""
+async def close_day(date_str: str) -> int:
+    """Закриває всі ВІЛЬНІ слоти на день (заброньовані записи не чіпає).
+    Повертає кількість закритих слотів."""
     free_slots = await get_free_slots_for_date(date_str)
     if not free_slots:
-        return
-    async with aiosqlite.connect(DB_PATH) as db:
-        for t in free_slots:
-            await db.execute(
-                "INSERT OR IGNORE INTO closed_slots (date, time) VALUES (?, ?)",
-                (date_str, t)
-            )
-        await db.commit()
+        return 0
+    async with _connect() as db:
+        await db.executemany(
+            "INSERT OR IGNORE INTO closed_slots (date, time) VALUES (?, ?)",
+            [(date_str[:10], t) for t in free_slots]
+        )
+    return len(free_slots)
 
 
 async def close_slot(date_str: str, time_str: str) -> bool:
-    """Закриває один конкретний вільний слот. Повертає False, якщо слот вже зайнятий або закритий."""
-    # Перевіряємо, що слот справді вільний (не заброньований)
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            "SELECT id FROM bookings WHERE date = ? AND time = ?", (date_str, time_str)
-        )
-        if await cursor.fetchone():
-            return False  # слот заброньований клієнтом — не можна закрити
+    """Закриває один конкретний вільний слот.
+    Повертає False, якщо слот зайнятий клієнтом або вже був закритий."""
+    date_str = date_str[:10]
+    async with _connect() as db:
+        await db.execute("BEGIN IMMEDIATE")
         try:
-            await db.execute(
+            cursor = await db.execute(
+                "SELECT id FROM bookings WHERE date = ? AND time = ?", (date_str, time_str)
+            )
+            if await cursor.fetchone():
+                await db.execute("ROLLBACK")
+                return False  # слот заброньований клієнтом — не можна закрити
+            cursor = await db.execute(
                 "INSERT OR IGNORE INTO closed_slots (date, time) VALUES (?, ?)",
                 (date_str, time_str)
             )
-            await db.commit()
-            return True
+            changed = cursor.rowcount > 0
+            await db.execute("COMMIT")
+            return changed
         except Exception:
-            return False
+            await db.execute("ROLLBACK")
+            raise
 
 
-async def reopen_day(date_str: str):
-    """Знову відкриває день (прибирає позначки 'закрито' для вже минулих закриттів)."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM closed_slots WHERE date = ?", (date_str,))
-        await db.commit()
+async def reopen_day(date_str: str) -> int:
+    """Знову відкриває день: прибирає всі позначки 'закрито' на цю дату.
+    Повертає кількість відкритих слотів."""
+    async with _connect() as db:
+        cursor = await db.execute("DELETE FROM closed_slots WHERE date = ?", (date_str[:10],))
+        return cursor.rowcount
+
+
+async def get_closed_dates() -> list[tuple[str, int]]:
+    """Дати від сьогодні, де є закриті слоти, і скільки їх. Для кнопки «Відкрити день»."""
+    async with _connect() as db:
+        cursor = await db.execute("""
+            SELECT date, COUNT(*) FROM closed_slots
+            WHERE date >= ? GROUP BY date ORDER BY date
+        """, (today_str(),))
+        return await cursor.fetchall()
 
 
 # ---------- НАГАДУВАННЯ ----------
 
 async def get_bookings_needing_day_before_reminder(tomorrow_str: str):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with _connect() as db:
         cursor = await db.execute("""
             SELECT id, date, time, telegram_id FROM bookings
             WHERE date = ? AND telegram_id IS NOT NULL AND notified_day_before = 0
@@ -295,25 +433,23 @@ async def get_bookings_needing_day_before_reminder(tomorrow_str: str):
         return await cursor.fetchall()
 
 
-async def get_bookings_needing_same_day_reminder(today_str: str):
-    async with aiosqlite.connect(DB_PATH) as db:
+async def get_bookings_needing_same_day_reminder(today_s: str):
+    async with _connect() as db:
         cursor = await db.execute("""
             SELECT id, date, time, telegram_id FROM bookings
             WHERE date = ? AND telegram_id IS NOT NULL AND notified_same_day = 0
-        """, (today_str,))
+        """, (today_s,))
         return await cursor.fetchall()
 
 
 async def mark_day_before_notified(booking_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with _connect() as db:
         await db.execute("UPDATE bookings SET notified_day_before = 1 WHERE id = ?", (booking_id,))
-        await db.commit()
 
 
 async def mark_same_day_notified(booking_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with _connect() as db:
         await db.execute("UPDATE bookings SET notified_same_day = 1 WHERE id = ?", (booking_id,))
-        await db.commit()
 
 
 # ---------- АНАЛІТИКА ----------
@@ -321,11 +457,38 @@ async def mark_same_day_notified(booking_id: int):
 async def get_monthly_stats(year: int, month: int):
     """Повертає (кількість_стрижок, сума_заробітку) за конкретний місяць."""
     prefix = f"{year:04d}-{month:02d}"
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with _connect() as db:
         cursor = await db.execute("""
             SELECT COUNT(*), COALESCE(SUM(price), 0) FROM bookings
             WHERE date LIKE ?
         """, (f"{prefix}%",))
         row = await cursor.fetchone()
         return row[0], row[1]
-                             
+
+
+async def get_stats_overview() -> dict:
+    """Зведення для кнопки «📊 Статистика»: цей місяць, попередній, найближчий тиждень."""
+    today = now()
+    this_month = await get_monthly_stats(today.year, today.month)
+    prev = today.replace(day=1) - timedelta(days=1)
+    last_month = await get_monthly_stats(prev.year, prev.month)
+
+    week_end = (today + timedelta(days=7)).strftime("%Y-%m-%d")
+    async with _connect() as db:
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM bookings WHERE date >= ? AND date <= ?",
+            (today_str(), week_end)
+        )
+        upcoming_week = (await cursor.fetchone())[0]
+        cursor = await db.execute("SELECT COUNT(*) FROM bookings WHERE date >= ?", (today_str(),))
+        upcoming_total = (await cursor.fetchone())[0]
+
+    return {
+        "this_month": this_month,
+        "last_month": last_month,
+        "prev_year": prev.year,
+        "prev_month": prev.month,
+        "upcoming_week": upcoming_week,
+        "upcoming_total": upcoming_total,
+        "clients": await count_clients(),
+    }
