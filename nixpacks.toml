@@ -3,3 +3,6 @@ cmds = ["pip install -r requirements.txt"]
 
 [start]
 cmd = "python bot.py"
+
+[variables]
+CACHEBUST = "1"
