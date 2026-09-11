@@ -125,6 +125,7 @@ def _generate_day_slots(date_obj: datetime) -> list[str]:
 
 
 async def get_free_slots_for_date(date_str: str) -> list[str]:
+    # fix: strip time component
     """Вільні слоти для клієнтів на конкретну дату (виключає заброньовані та закриті)."""
     # Обрізаємо до YYYY-MM-DD на випадок якщо прийшов рядок з часом
     date_str = date_str[:10]
